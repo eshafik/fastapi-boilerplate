@@ -1,0 +1,90 @@
+# Byte-compiled / optimized Python files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments (e.g. pipenv, poetry, virtualenv)
+.env/
+venv/
+env/
+ENV/
+
+# IDE files (e.g. PyCharm, VSCode)
+.idea/
+.vscode/
+
+# Logs and runtime data
+*.log
+*.pot
+*.po
+*.mo
+*.tmp
+*.pid
+*.bak
+*.swp
+
+# Package directories
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+
+# Database files
+*.sqlite3
+*.sql
+
+# Configuration files that may contain sensitive information
+config/settings.py
+config/.env
+
+# Ignore celery-related files
+celerybeat-schedule
+
+# Ignore compiled Python files
+*.pyc
+
+# Ignore local configuration file
+local_settings.py
+
+# Ignore generated files
+*.bak
+*.json
+
+# Ignore migrations
+*/migrations
+
+# Ignore coverage report
+htmlcov/
+.coverage
+
+# Ignore pytest cache
+pytest_cache/
+
+# Ignore mypy cache
+.mypy_cache/
+
+# Ignore type checker
+.pyre/
+
+# Ignore Jupyter notebooks
+.ipynb_checkpoints/
+
+# Ignore Docker artifacts
+Dockerfile
+docker-compose.yml
+
+# Ignore poetry virtual environment
+.poetry/
+
+# Ignore pip files
+pip-requirements/
+
+# Ignore any environment-specific files
+.env.*
+.env
+db.*
