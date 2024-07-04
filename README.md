@@ -1,5 +1,3 @@
-Certainly! Here's a refined version:
-
 Are you a Django developer missing the swift development process? If so, consider using this boilerplate designed 
 to provide a Django-like experience. It utilizes Tortoise ORM to replicate the feel of Django's ORM. 
 You can also write Celery tasks similar to Django and manage apps with commands like 'python manage.py'.
