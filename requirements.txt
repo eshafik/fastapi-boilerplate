@@ -1,5 +1,7 @@
 fastapi==0.111.0
 click==8.1.7
 tortoise-orm==0.21.4
+asyncpg==0.29.0
+aiomysql==0.2.0
 celery==5.4.0
 redis==5.0.7

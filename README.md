@@ -1,8 +1,15 @@
-Are you a Django developer missing the swift development process? If so, consider using this boilerplate designed 
-to provide a Django-like experience. It utilizes Tortoise ORM to replicate the feel of Django's ORM. 
-You can also write Celery tasks similar to Django and manage apps with commands like 'python manage.py'.
+Welcome to FastAPI Boilerplate, a organized structure for rapid API development inspired by Django's efficiency. 
+Utilizing Tortoise ORM, it mirrors the seamless ORM experience of Django while enabling easy integration 
+of Celery for background task management. With intuitive CLI commands like 'python manage.py runserver',
+'python manage.py startapp' and so on. Jumpstart your projects with ease.
 
-Simply pull the repository and launch your project seamlessly. 
+Key Features:
+
+- Django-like ORM experience with Tortoise ORM
+- Celery integration for asynchronous task handling
+- Simplified app management with CLI commands
+- Fast and efficient API development
+- Get started quickly—pull the repository and elevate your development workflow today! 
 
 # Project Structure:
 ```bash
