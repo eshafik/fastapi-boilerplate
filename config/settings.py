@@ -20,7 +20,7 @@ INSTALLED_APPS = [
 ]
 
 # Database settings
-TORTOISE_ORM = {
+TORTOISE_ORM_CONFIG = {
     "connections": {
         "default": os.getenv("DATABASE_URL", "sqlite://db.sqlite3")
     },
