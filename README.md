@@ -15,7 +15,7 @@ Key Features:
 ```bash
 project/
 ├── apps/
-│   ├── app1/
+│   ├── user/
 │   │   ├── __init__.py
 │   │   ├── models.py
 │   │   ├── routers.py
@@ -45,7 +45,7 @@ project/
 ```python
 # Installed apps
 INSTALLED_APPS = [
-    'apps.app1',
+    'apps.user',
     # Add more apps here
 ]
 ```

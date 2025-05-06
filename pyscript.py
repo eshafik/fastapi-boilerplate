@@ -1,6 +1,6 @@
 import asyncio
 
-from apps.app1.views import example_view
+from apps.user.views import example_view
 
 # import anything from the project
 

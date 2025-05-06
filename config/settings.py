@@ -15,7 +15,7 @@ DEBUG = FASTAPI_ENV == 'development'
 
 # Installed apps
 INSTALLED_APPS = [
-    'apps.app1',
+    'apps.user',
     # Add more apps here
 ]
 
