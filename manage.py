@@ -6,7 +6,9 @@ from config.celery import celery_app
 import sys
 from fastapi import FastAPI
 from tortoise import Tortoise, run_async
-from config.settings import TORTOISE_ORM, INSTALLED_APPS, DEBUG
+
+from config.db import init_db
+from config.settings import TORTOISE_ORM_CONFIG, INSTALLED_APPS, DEBUG
 
 APP_TEMPLATE = """
 # {app_name}/__init__.py
@@ -114,13 +116,11 @@ def runscript(script_name):
 
     for app_name in INSTALLED_APPS:
         models_module = f"{app_name}.models"
-        if models_module not in TORTOISE_ORM['apps']['models']['models']:
-            TORTOISE_ORM['apps']['models']['models'].append(models_module)
+        if models_module not in TORTOISE_ORM_CONFIG['apps']['models']['models']:
+            TORTOISE_ORM_CONFIG['apps']['models']['models'].append(models_module)
 
     async def run():
-        await Tortoise.init(config=TORTOISE_ORM)
-        await Tortoise.generate_schemas()
-
+        await init_db(db_config=TORTOISE_ORM_CONFIG)
         # Load and execute the script
         script_path = os.path.join(os.path.dirname(__file__), script_name)
         if not os.path.exists(script_path):

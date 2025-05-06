@@ -1,8 +1,8 @@
 # config/celery.py
 from celery import Celery, signals
 
+from config.db import init_db
 from config.settings import CELERY_BROKER_URL, CELERY_RESULT_BACKEND, INSTALLED_APPS
-from config.tortoise import init_tortoise
 
 celery_app = Celery('fastapi_tortoise_boilerplate', broker=CELERY_BROKER_URL, backend=CELERY_RESULT_BACKEND)
 
@@ -26,4 +26,4 @@ celery_app.conf.update(
 @signals.worker_process_init.connect
 def init_worker(**kwargs):
     import asyncio
-    asyncio.run(init_tortoise())
+    asyncio.run(init_db())
