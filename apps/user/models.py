@@ -1,5 +1,3 @@
-import uuid
-
 from tortoise import fields, models
 
 
@@ -11,6 +9,7 @@ class User(models.Model):
     name = fields.CharField(max_length=100, null=True)
     joined_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
+    last_login = fields.DatetimeField(null=True)
 
     class Meta:
         default_connection = "default"

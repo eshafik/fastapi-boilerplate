@@ -9,7 +9,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 1440  # 1 day
 
 
 def generate_jwt_token(user: User) -> str:
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.now() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     payload = {
         "sub": str(user.username),
         "exp": expire,

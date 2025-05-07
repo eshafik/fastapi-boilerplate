@@ -1,8 +1,20 @@
 import uuid
 
+from tortoise.exceptions import DoesNotExist
+
 from apps.user.models import User
-from utils.security import hash_password
+from utils.security import hash_password, verify_password
 from typing import Optional, Tuple
+
+
+async def authenticate_user(email: str, password: str) -> Optional[User]:
+    try:
+        user = await User.get(email=email)
+    except DoesNotExist:
+        return None
+    if not user.password or not verify_password(password, user.password):
+        return None
+    return user
 
 
 async def create_user(email: Optional[str] = None,
@@ -11,6 +23,7 @@ async def create_user(email: Optional[str] = None,
                       name: Optional[str] = None) -> User:
     hashed_pwd = password and hash_password(password) or None
     username = username or uuid.uuid4().hex
+    name = name or f'Anonymous-{uuid.uuid4().hex[:5]}'
     user = await User.create(username=username, email=email, password=hashed_pwd, name=name)
     return user
 

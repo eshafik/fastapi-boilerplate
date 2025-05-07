@@ -3,10 +3,15 @@ import importlib
 
 import uvloop
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.exceptions import RequestValidationError
+from pydantic import ValidationError
+from starlette.responses import JSONResponse
 from tortoise import connections
 from tortoise.exceptions import DBConnectionError
 
 from config.db import init_db, close_db, reconnect_db
+from config.renderer import (custom_request_validation_exception_handler,
+                             custom_http_exception_handler, custom_validation_error_handler)
 from config.settings import TORTOISE_ORM_CONFIG, DEBUG, INSTALLED_APPS
 from config.middleware import CustomMiddleware
 
@@ -34,14 +39,6 @@ for app_name in INSTALLED_APPS:
     if models_module:
         TORTOISE_ORM_CONFIG["apps"]["models"]["models"].append(f"{app_name}.models")
 
-# # Register Tortoise ORM
-# register_tortoise(
-#     app,
-#     config=TORTOISE_ORM,
-#     generate_schemas=True,
-#     add_exception_handlers=True,
-# )
-
 
 @app.on_event("startup")
 async def startup_event():
@@ -58,19 +55,40 @@ async def shutdown_event():
 async def db_session_middleware(request: Request, call_next):
     try:
         # Opens connection if not already
-        connection = connections.get("default")
-        if not connection.is_connected:
-            await connection.connect()
+        conn = connections.get("default")
+        await conn.execute_query("SELECT 1")
 
         response = await call_next(request)
         return response
     except DBConnectionError as db_err:
         await reconnect_db()
-        raise HTTPException(status_code=500, detail="Database error occurred")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Internal server error")
     finally:
         # Optional: don't close if persistent connection is preferred
         # await connections.get("default").close()
         pass
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request, exc):
+    return await custom_request_validation_exception_handler(request, exc)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    return await custom_http_exception_handler(request, exc)
+
+
+@app.exception_handler(ValidationError)
+async def validator_error_handler(request, exc):
+    return await custom_validation_error_handler(request, exc)
+
+
+@app.exception_handler(Exception)
+async def custom_exception_handler(request, exc):
+    response_data = {"status": False, "message": 'An error occurred', 'details': str(exc)}
+    return JSONResponse(content=response_data)
 
 if __name__ == "__main__":
     import uvicorn
