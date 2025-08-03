@@ -1,3 +1,4 @@
+# document/elasticsearch_client.py
 from elasticsearch import AsyncElasticsearch
 from typing import Dict, Any, Optional, List
 import json

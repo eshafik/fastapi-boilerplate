@@ -87,8 +87,27 @@ async def validator_error_handler(request, exc):
 
 @app.exception_handler(Exception)
 async def custom_exception_handler(request, exc):
-    response_data = {"status": False, "message": 'An error occurred', 'details': str(exc)}
-    return JSONResponse(content=response_data)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "message": "Internal server error",
+            "details": f"Unexpected error on {request.url}: {exc}",
+            "status_code": 500,
+            "path": str(request.url)
+        }
+    )
+
+
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    """Add processing time to response headers"""
+    import time
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    response.headers["X-Process-Time"] = str(process_time)
+    return response
 
 if __name__ == "__main__":
     import uvicorn

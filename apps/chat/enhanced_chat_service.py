@@ -1,3 +1,22 @@
+# chat/enhanced_chat_service.py
+import asyncio
+import time
+import json
+from typing import List, Dict, Any, Optional, Tuple, AsyncGenerator
+from uuid import UUID, uuid4
+import logging
+from datetime import datetime, timedelta
+
+from openai import AsyncOpenAI
+from tortoise.transactions import in_transaction
+
+from apps.chat.models import ChatSession, ChatMessage, SessionChunkMemory
+from apps.document.elasticsearch_client import es_client
+from config.settings import OPENAI_API_KEY, ELASTICSEARCH_DEFAULT_INDEX_NAME
+from utils.response_formatter import response_formatter
+
+logger = logging.getLogger(__name__)
+
 # services/enhanced_chat_service.py
 import asyncio
 import time
@@ -14,6 +33,7 @@ from models.chat import ChatSession, ChatMessage, SessionChunkMemory
 from elasticsearch_client import es_client
 from config.settings import OPENAI_API_KEY, ELASTICSEARCH_INDEX_NAME
 from utils.response_formatter import response_formatter, token_counter
+from utils.cache_manager import CacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -24,32 +44,32 @@ class EnhancedChatService:
         self.embedding_model = "text-embedding-3-small"
         self.chat_model = "gpt-4o-mini"
 
+        # Initialize cache manager
+        self.cache_manager = CacheManager()
+
         # Advanced configuration
         self.max_conversation_history = 10
         self.chunk_memory_decay_days = 7
         self.max_chunk_reuse_count = 3
-
-        # Performance settings
-        self.embedding_cache = {}  # Simple in-memory cache
-        self.cache_ttl = 3600  # 1 hour
 
         # Quality settings
         self.min_chunk_score_threshold = 0.1
         self.semantic_similarity_weight = 0.7
         self.keyword_match_weight = 0.3
 
+        # Performance settings
+        self.max_concurrent_requests = 10
+        self.request_timeout = 30
+
     async def get_cached_embedding(self, text: str) -> List[float]:
-        """Get embedding with caching"""
+        """Get embedding with optimized caching"""
 
-        # Simple cache key
-        cache_key = hash(text)
-        current_time = time.time()
+        cache_key = f"embedding:{hash(text)}"
 
-        # Check cache
-        if cache_key in self.embedding_cache:
-            cached_data = self.embedding_cache[cache_key]
-            if current_time - cached_data['timestamp'] < self.cache_ttl:
-                return cached_data['embedding']
+        # Try cache first
+        cached_embedding = await self.cache_manager.get(cache_key)
+        if cached_embedding:
+            return cached_embedding
 
         # Get new embedding
         try:
@@ -59,11 +79,8 @@ class EnhancedChatService:
             )
             embedding = response.data[0].embedding
 
-            # Cache it
-            self.embedding_cache[cache_key] = {
-                'embedding': embedding,
-                'timestamp': current_time
-            }
+            # Cache with 1 hour TTL
+            await self.cache_manager.set(cache_key, embedding, ttl=3600)
 
             return embedding
 
@@ -76,135 +93,187 @@ class EnhancedChatService:
             query: str,
             raw_chunks: List[Dict[str, Any]],
             conversation_history: List[Dict[str, str]],
+            session_memory: Dict[str, float],
             max_chunks: int = 5
     ) -> List[Dict[str, Any]]:
-        """Intelligently select the most relevant chunks based on context"""
+        """Intelligently select the most relevant chunks with advanced scoring"""
 
         if not raw_chunks:
             return []
 
-        # Score chunks based on multiple factors
         scored_chunks = []
 
         for chunk in raw_chunks:
-            score = chunk['score']
+            base_score = chunk['score']
+            chunk_id = chunk['chunk_id']
 
-            # Boost score based on recency of document
+            # Apply memory boost if chunk was previously useful
+            memory_boost = session_memory.get(chunk_id, 0) * 0.1
+
+            # Recency boost for newer documents
             metadata = chunk.get('metadata', {})
+            recency_boost = 0
             if 'created_at' in metadata:
-                # Newer documents get slight boost
-                doc_age_days = (datetime.now() - datetime.fromisoformat(metadata['created_at'])).days
-                recency_boost = max(0, 1 - (doc_age_days / 365)) * 0.1
-                score += recency_boost
+                try:
+                    doc_date = datetime.fromisoformat(metadata['created_at'])
+                    doc_age_days = (datetime.now() - doc_date).days
+                    recency_boost = max(0, 1 - (doc_age_days / 365)) * 0.05
+                except:
+                    pass
 
-            # Boost score if chunk relates to recent conversation
+            # Context relevance boost
+            context_boost = 0
             if conversation_history:
                 recent_context = " ".join([msg['content'] for msg in conversation_history[-3:]])
-                # Simple keyword overlap check
                 chunk_words = set(chunk['content'].lower().split())
                 context_words = set(recent_context.lower().split())
                 overlap = len(chunk_words.intersection(context_words))
                 if overlap > 0:
-                    score += min(overlap * 0.05, 0.2)  # Cap the boost
+                    context_boost = min(overlap * 0.03, 0.15)
+
+            # Diversity penalty for very similar chunks
+            diversity_penalty = 0
+            for existing_chunk in scored_chunks:
+                existing_words = set(existing_chunk['content'].lower().split())
+                current_words = set(chunk['content'].lower().split())
+                similarity = len(existing_words.intersection(current_words)) / len(existing_words.union(current_words))
+                if similarity > 0.8:
+                    diversity_penalty = min(diversity_penalty + 0.1, 0.3)
+
+            # Calculate final score
+            final_score = base_score + memory_boost + recency_boost + context_boost - diversity_penalty
 
             # Apply minimum threshold
-            if score >= self.min_chunk_score_threshold:
+            if final_score >= self.min_chunk_score_threshold:
                 scored_chunks.append({
                     **chunk,
-                    'adjusted_score': score
+                    'adjusted_score': final_score,
+                    'score_breakdown': {
+                        'base_score': base_score,
+                        'memory_boost': memory_boost,
+                        'recency_boost': recency_boost,
+                        'context_boost': context_boost,
+                        'diversity_penalty': diversity_penalty
+                    }
                 })
 
         # Sort by adjusted score and take top chunks
         scored_chunks.sort(key=lambda x: x['adjusted_score'], reverse=True)
         return scored_chunks[:max_chunks]
 
-    async def build_dynamic_prompt(
+    async def build_optimized_prompt(
             self,
             user_query: str,
             retrieved_chunks: List[Dict[str, Any]],
             conversation_history: List[Dict[str, str]],
-            user_preferences: Dict[str, Any] = None
+            user_preferences: Dict[str, Any] = None,
+            max_context_tokens: int = 3000
     ) -> List[Dict[str, str]]:
-        """Build dynamic, context-aware prompts"""
+        """Build optimized prompt with token management"""
 
         user_preferences = user_preferences or {}
 
-        # Adaptive system message based on query type and context
+        # Adaptive system message
         system_parts = [
-            "You are a knowledgeable AI assistant with access to a curated knowledge base.",
-            "Provide accurate, helpful, and contextually relevant responses."
+            "You are an expert AI assistant with access to a comprehensive knowledge base.",
+            "Provide accurate, helpful, and contextually relevant responses based on the retrieved information."
         ]
 
-        # Analyze query type
+        # Query type analysis for specialized instructions
         query_lower = user_query.lower()
+        query_indicators = {
+            'explanation': ['explain', 'what is', 'define', 'describe', 'clarify'],
+            'instruction': ['how to', 'steps', 'guide', 'tutorial', 'process'],
+            'comparison': ['compare', 'difference', 'versus', 'vs', 'better'],
+            'summary': ['summarize', 'summary', 'overview', 'brief'],
+            'analysis': ['analyze', 'evaluate', 'assess', 'examine']
+        }
 
-        if any(word in query_lower for word in ['explain', 'what is', 'define', 'describe']):
-            system_parts.append("Focus on providing clear, comprehensive explanations with examples when helpful.")
-        elif any(word in query_lower for word in ['how to', 'steps', 'guide', 'tutorial']):
-            system_parts.append("Provide step-by-step guidance and practical instructions.")
-        elif any(word in query_lower for word in ['compare', 'difference', 'versus', 'vs']):
-            system_parts.append("Focus on clear comparisons, highlighting key differences and similarities.")
-        elif any(word in query_lower for word in ['summarize', 'summary', 'overview']):
-            system_parts.append("Provide concise, well-structured summaries hitting the main points.")
+        query_type = 'general'
+        for qtype, indicators in query_indicators.items():
+            if any(indicator in query_lower for indicator in indicators):
+                query_type = qtype
+                break
 
-        # Add context instructions
+        # Add type-specific instructions
+        type_instructions = {
+            'explanation': "Focus on clear, comprehensive explanations with examples when helpful.",
+            'instruction': "Provide step-by-step guidance with actionable instructions.",
+            'comparison': "Highlight key differences and similarities in a structured format.",
+            'summary': "Provide concise, well-organized summaries covering main points.",
+            'analysis': "Offer thorough analysis with reasoning and evidence."
+        }
+
+        if query_type in type_instructions:
+            system_parts.append(type_instructions[query_type])
+
+        # Add context from retrieved chunks
         if retrieved_chunks:
-            system_parts.append("\nUse the following context from the knowledge base to inform your response:")
+            system_parts.append("\n**Knowledge Base Context:**")
 
-            # Format context with source attribution
             context_parts = []
             for i, chunk in enumerate(retrieved_chunks, 1):
                 metadata = chunk.get('metadata', {})
 
-                # Build source attribution
-                source_info = f"[Source {i}"
+                # Build concise source attribution
+                source_info = f"[{i}]"
                 if metadata.get('document_title'):
-                    source_info += f": {metadata['document_title']}"
+                    source_info += f" {metadata['document_title']}"
                 if metadata.get('page_number'):
-                    source_info += f", Page {metadata['page_number']}"
-                source_info += f", Relevance: {chunk.get('adjusted_score', chunk.get('score', 0)):.2f}]"
+                    source_info += f" (p.{metadata['page_number']})"
 
-                context_parts.append(f"{source_info}\n{chunk['content']}")
+                # Truncate very long chunks to manage tokens
+                content = chunk['content']
+                if len(content) > 800:
+                    content = content[:750] + "..."
 
-            system_parts.append("\n\n" + "\n\n".join(context_parts))
+                context_parts.append(f"{source_info}: {content}")
+
+            system_parts.append("\n".join(context_parts))
 
         # Add response guidelines
         guidelines = [
-            "\nResponse Guidelines:",
-            "- Be accurate and cite sources when referencing specific information",
-            "- If information is insufficient, clearly state what's missing",
-            "- Maintain conversation flow and reference previous exchanges when relevant",
-            "- Be concise but thorough"
+            "\n**Response Guidelines:**",
+            "• Cite sources using [1], [2], etc. when referencing specific information",
+            "• If information is insufficient, clearly state limitations",
+            "• Maintain conversational flow and build on previous exchanges",
+            "• Be precise but comprehensive"
         ]
 
+        # User preference adjustments
         if user_preferences.get('detailed_responses'):
-            guidelines.append("- Provide detailed explanations with examples")
-        if user_preferences.get('prefer_bullet_points'):
-            guidelines.append("- Use bullet points and structured formatting when appropriate")
+            guidelines.append("• Provide detailed explanations with examples and context")
+        if user_preferences.get('structured_format'):
+            guidelines.append("• Use clear structure with headings and bullet points")
+        if user_preferences.get('technical_depth'):
+            guidelines.append("• Include technical details and implementation specifics")
 
         system_parts.extend(guidelines)
 
-        # Build message list
+        # Build initial message list
         messages = [{"role": "system", "content": "\n".join(system_parts)}]
 
-        # Add conversation history (optimized for token usage)
+        # Add optimized conversation history
         if conversation_history:
-            # Summarize older messages if history is long
-            if len(conversation_history) > 6:
-                recent_messages = conversation_history[-4:]
-                older_messages = conversation_history[:-4]
+            # Estimate tokens and optimize history length
+            system_tokens = token_counter.count_message_tokens([messages[0]])
+            available_tokens = max_context_tokens - system_tokens - 200  # Reserve for user query
 
-                # Create summary of older context
-                older_summary = "Previous conversation context: " + " ".join([
-                    f"{msg['role']}: {msg['content'][:100]}..."
-                    for msg in older_messages[-4:]  # Last 4 of the older messages
-                ])
-                messages.append({"role": "system", "content": older_summary})
-                messages.extend(recent_messages)
-            else:
-                messages.extend(conversation_history)
+            # Add conversation history within token limits
+            history_messages = []
+            current_tokens = 0
 
-        # Add current query
+            # Start from most recent and work backwards
+            for msg in reversed(conversation_history):
+                msg_tokens = token_counter.count_message_tokens([msg])
+                if current_tokens + msg_tokens > available_tokens:
+                    break
+                history_messages.insert(0, msg)
+                current_tokens += msg_tokens
+
+            messages.extend(history_messages)
+
+        # Add current user query
         messages.append({"role": "user", "content": user_query})
 
         return messages
@@ -215,7 +284,7 @@ class EnhancedChatService:
             temperature: float = 0.7,
             max_tokens: int = 1000
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Generate streaming response from OpenAI"""
+        """Generate streaming response with error handling"""
 
         try:
             stream = await self.openai_client.chat.completions.create(
@@ -228,8 +297,11 @@ class EnhancedChatService:
             )
 
             full_content = ""
+            chunk_count = 0
 
             async for chunk in stream:
+                chunk_count += 1
+
                 if chunk.choices and chunk.choices[0].delta.content:
                     content = chunk.choices[0].delta.content
                     full_content += content
@@ -237,10 +309,11 @@ class EnhancedChatService:
                     yield {
                         "type": "content",
                         "content": content,
-                        "full_content": full_content
+                        "full_content": full_content,
+                        "chunk_index": chunk_count
                     }
 
-                # Handle usage info (comes at the end)
+                # Handle usage info
                 if hasattr(chunk, 'usage') and chunk.usage:
                     yield {
                         "type": "usage",
@@ -255,7 +328,8 @@ class EnhancedChatService:
             logger.error(f"Error in streaming response: {e}")
             yield {
                 "type": "error",
-                "error": str(e)
+                "error": str(e),
+                "error_type": type(e).__name__
             }
 
     async def process_chat_with_advanced_features(
@@ -263,6 +337,7 @@ class EnhancedChatService:
             user_id: str,
             message: str,
             session_id: Optional[UUID] = None,
+            session_name: Optional[str] = None,
             max_chunks: int = 5,
             temperature: float = 0.7,
             max_tokens: int = 1000,
@@ -270,30 +345,37 @@ class EnhancedChatService:
             include_metadata: bool = True,
             stream_response: bool = False
     ) -> Dict[str, Any]:
-        """Advanced chat processing with enhanced features"""
+        """Main chat processing with comprehensive features"""
 
         start_time = time.time()
         processing_steps = []
+        user_preferences = user_preferences or {}
 
         async with in_transaction():
             try:
                 # Step 1: Session management
                 step_start = time.time()
-                session = await self.create_or_get_session(user_id, session_id)
+                session = await self.create_or_get_session(
+                    user_id=user_id,
+                    session_id=session_id,
+                    session_name=session_name
+                )
                 processing_steps.append({
                     "step": "session_management",
                     "duration_ms": int((time.time() - step_start) * 1000)
                 })
 
-                # Step 2: Get embedding
+                # Step 2: Get embedding with caching
                 step_start = time.time()
                 embedding = await self.get_cached_embedding(message)
+                cache_hit = await self.cache_manager.exists(f"embedding:{hash(message)}")
                 processing_steps.append({
                     "step": "embedding_generation",
-                    "duration_ms": int((time.time() - step_start) * 1000)
+                    "duration_ms": int((time.time() - step_start) * 1000),
+                    "cache_hit": cache_hit
                 })
 
-                # Step 3: Conversation context
+                # Step 3: Get conversation context
                 step_start = time.time()
                 conversation_history = await self.get_conversation_context(session)
                 processing_steps.append({
@@ -301,9 +383,10 @@ class EnhancedChatService:
                     "duration_ms": int((time.time() - step_start) * 1000)
                 })
 
-                # Step 4: Memory management
+                # Step 4: Session memory management
                 step_start = time.time()
                 used_chunk_ids = await self.get_session_chunk_memory(session)
+                session_memory = await self.get_session_memory_scores(session)
                 processing_steps.append({
                     "step": "memory_management",
                     "duration_ms": int((time.time() - step_start) * 1000)
@@ -328,6 +411,7 @@ class EnhancedChatService:
                     query=message,
                     raw_chunks=raw_chunks,
                     conversation_history=conversation_history,
+                    session_memory=session_memory,
                     max_chunks=max_chunks
                 )
                 processing_steps.append({
@@ -335,36 +419,38 @@ class EnhancedChatService:
                     "duration_ms": int((time.time() - step_start) * 1000)
                 })
 
-                # Step 7: Dynamic prompt building
+                # Step 7: Optimized prompt building
                 step_start = time.time()
-                prompt_messages = await self.build_dynamic_prompt(
+                prompt_messages = await self.build_optimized_prompt(
                     user_query=message,
                     retrieved_chunks=selected_chunks,
                     conversation_history=conversation_history,
-                    user_preferences=user_preferences
+                    user_preferences=user_preferences,
+                    max_context_tokens=3500
                 )
                 processing_steps.append({
                     "step": "prompt_building",
                     "duration_ms": int((time.time() - step_start) * 1000)
                 })
 
-                # Step 8: Token counting and optimization
+                # Step 8: Token optimization
                 step_start = time.time()
                 prompt_tokens = token_counter.count_message_tokens(prompt_messages)
-                available_tokens = token_counter.estimate_response_tokens(max_tokens, prompt_tokens)
+                available_tokens = min(max_tokens, 4000 - prompt_tokens - 100)  # Safety margin
 
-                if available_tokens < 100:  # Too little space for response
-                    # Trim conversation history
-                    if len(conversation_history) > 2:
-                        conversation_history = conversation_history[-2:]
-                        prompt_messages = await self.build_dynamic_prompt(
-                            user_query=message,
-                            retrieved_chunks=selected_chunks,
-                            conversation_history=conversation_history,
-                            user_preferences=user_preferences
-                        )
-                        prompt_tokens = token_counter.count_message_tokens(prompt_messages)
-                        available_tokens = token_counter.estimate_response_tokens(max_tokens, prompt_tokens)
+                if available_tokens < 100:
+                    # Aggressive optimization if needed
+                    conversation_history = conversation_history[-2:] if len(
+                        conversation_history) > 2 else conversation_history
+                    prompt_messages = await self.build_optimized_prompt(
+                        user_query=message,
+                        retrieved_chunks=selected_chunks[:3],  # Reduce chunks too
+                        conversation_history=conversation_history,
+                        user_preferences=user_preferences,
+                        max_context_tokens=2500
+                    )
+                    prompt_tokens = token_counter.count_message_tokens(prompt_messages)
+                    available_tokens = min(max_tokens, 4000 - prompt_tokens - 100)
 
                 processing_steps.append({
                     "step": "token_optimization",
@@ -375,15 +461,16 @@ class EnhancedChatService:
 
                 # Step 9: Response generation
                 step_start = time.time()
+
                 if stream_response:
-                    # For streaming, return the generator and metadata separately
+                    # Return streaming generator and metadata
                     response_generator = self.generate_streaming_response(
                         messages=prompt_messages,
                         temperature=temperature,
                         max_tokens=available_tokens
                     )
 
-                    # Save user message immediately for streaming
+                    # Save user message for streaming
                     user_message = await ChatMessage.create(
                         session=session,
                         role="user",
@@ -400,7 +487,7 @@ class EnhancedChatService:
                         "processing_steps": processing_steps
                     }
                 else:
-                    # Standard non-streaming response
+                    # Standard response generation
                     response_text, token_usage = await self.generate_response(
                         messages=prompt_messages,
                         temperature=temperature,
@@ -436,7 +523,13 @@ class EnhancedChatService:
                     retrieval_metadata={
                         **retrieval_metadata,
                         "token_usage": token_usage,
-                        "processing_steps": processing_steps
+                        "processing_steps": processing_steps,
+                        "chunk_selection_details": [
+                            {
+                                "chunk_id": chunk['chunk_id'],
+                                "score_breakdown": chunk.get('score_breakdown', {})
+                            } for chunk in selected_chunks
+                        ] if include_metadata else []
                     },
                     token_count=token_usage.get("total_tokens", 0)
                 )
@@ -454,21 +547,34 @@ class EnhancedChatService:
                     "duration_ms": int((time.time() - step_start) * 1000)
                 })
 
-                # Final response preparation
+                # Prepare final response
                 total_processing_time = int((time.time() - start_time) * 1000)
-
-                retrieved_chunks_formatted = response_formatter.format_retrieval_results(selected_chunks)
-
                 message_count = await ChatMessage.filter(session=session).count()
+
+                # Format retrieved chunks for response
+                formatted_chunks = []
+                if include_metadata:
+                    for chunk in selected_chunks:
+                        formatted_chunks.append({
+                            "chunk_id": chunk['chunk_id'],
+                            "content": chunk['content'][:200] + "..." if len(chunk['content']) > 200 else chunk[
+                                'content'],
+                            "score": chunk.get('adjusted_score', chunk['score']),
+                            "metadata": chunk.get('metadata', {})
+                        })
 
                 return {
                     "message_id": assistant_message.id,
                     "session_id": session.id,
                     "response": response_text,
-                    "retrieved_chunks": retrieved_chunks_formatted if include_metadata else [],
+                    "retrieved_chunks": formatted_chunks,
                     "total_chunks_available": len(raw_chunks),
                     "chunks_selected": len(selected_chunks),
-                    "token_usage": token_usage,
+                    "token_usage": {
+                        "prompt_tokens": token_usage.get("prompt_tokens", 0),
+                        "completion_tokens": token_usage.get("completion_tokens", 0),
+                        "total_tokens": token_usage.get("total_tokens", 0)
+                    },
                     "processing_time_ms": total_processing_time,
                     "processing_steps": processing_steps,
                     "message_count": message_count,
@@ -477,7 +583,7 @@ class EnhancedChatService:
                         "cache_hits": len([step for step in processing_steps if step.get("cache_hit")]),
                         "total_steps": len(processing_steps),
                         "retrieval_efficiency": len(selected_chunks) / max(len(raw_chunks), 1),
-                        "token_efficiency": token_usage.get("total_tokens", 0) / max_tokens
+                        "token_efficiency": token_usage.get("total_tokens", 0) / max(max_tokens, 1)
                     }
                 }
 
@@ -489,64 +595,103 @@ class EnhancedChatService:
             self,
             user_id: str,
             session_id: Optional[UUID] = None,
-            session_name: Optional[str] = None
+            session_name: Optional[str] = None,
+            config: Optional[Dict[str, Any]] = None
     ) -> ChatSession:
-        """Create new session or retrieve existing one"""
+        """Create new session or retrieve existing one with enhanced configuration"""
 
         if session_id:
             session = await ChatSession.get_or_none(id=session_id, user_id=user_id, is_active=True)
             if session:
                 return session
 
-        # Create new session
+        # Create new session with optimized defaults
+        default_config = {
+            "max_chunks": 5,
+            "temperature": 0.7,
+            "max_tokens": 1000,
+            "created_via": "rest_api",
+            "features": [
+                "intelligent_selection",
+                "optimized_prompts",
+                "token_optimization",
+                "memory_management",
+                "performance_tracking"
+            ],
+            "version": "2.0"
+        }
+
+        if config:
+            default_config.update(config)
+
         session = await ChatSession.create(
             user_id=user_id,
             session_name=session_name or f"Chat {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-            config={
-                "max_chunks": 5,
-                "temperature": 0.7,
-                "max_tokens": 1000,
-                "created_via": "enhanced_api",
-                "features": ["intelligent_selection", "dynamic_prompts", "token_optimization"]
-            }
+            config=default_config
         )
 
         logger.info(f"Created new enhanced chat session {session.id} for user {user_id}")
         return session
 
     async def get_conversation_context(self, session: ChatSession, limit: int = None) -> List[Dict[str, str]]:
-        """Get recent conversation history for context"""
+        """Get optimized conversation history"""
         limit = limit or self.max_conversation_history
 
         messages = await ChatMessage.filter(
             session=session
         ).order_by('-created_at').limit(limit).values(
-            'role', 'content', 'created_at'
+            'role', 'content', 'created_at', 'token_count'
         )
 
-        # Reverse to get chronological order
-        return [
-            {"role": msg["role"], "content": msg["content"]}
-            for msg in reversed(messages)
-        ]
+        # Return in chronological order with token-aware truncation
+        context_messages = []
+        total_tokens = 0
+        max_context_tokens = 2000
+
+        for msg in reversed(messages):
+            # Estimate tokens for this message
+            msg_tokens = msg.get('token_count', len(msg['content']) // 4)
+
+            if total_tokens + msg_tokens > max_context_tokens and context_messages:
+                break
+
+            context_messages.append({
+                "role": msg["role"],
+                "content": msg["content"]
+            })
+            total_tokens += msg_tokens
+
+        return context_messages
 
     async def get_session_chunk_memory(self, session: ChatSession) -> List[str]:
-        """Get list of chunk IDs already used in this session"""
+        """Get chunk IDs to avoid immediate reuse"""
 
-        # Clean up old memory first
+        # Clean up old memory
         cutoff_date = datetime.now() - timedelta(days=self.chunk_memory_decay_days)
         await SessionChunkMemory.filter(
             session=session,
             last_used_at__lt=cutoff_date
         ).delete()
 
-        # Get current memory with usage limits
+        # Get chunks that haven't been overused
         memory = await SessionChunkMemory.filter(
             session=session,
             usage_count__lt=self.max_chunk_reuse_count
         ).values_list('chunk_id', flat=True)
 
         return list(memory)
+
+    async def get_session_memory_scores(self, session: ChatSession) -> Dict[str, float]:
+        """Get memory scores for intelligent selection"""
+
+        memory_records = await SessionChunkMemory.filter(session=session).values(
+            'chunk_id', 'relevance_score', 'usage_count'
+        )
+
+        return {
+            record['chunk_id']: record['relevance_score'] * (1 + record['usage_count'] * 0.1)
+            for record in memory_records
+        }
 
     async def hybrid_retrieve(
             self,
@@ -555,7 +700,7 @@ class EnhancedChatService:
             exclude_chunk_ids: Optional[List[str]] = None,
             max_chunks: int = 10
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        """Enhanced hybrid retrieval with performance tracking"""
+        """Enhanced hybrid retrieval with comprehensive metadata"""
 
         start_time = time.time()
 
@@ -568,25 +713,32 @@ class EnhancedChatService:
                 exclude_chunk_ids=exclude_chunk_ids or []
             )
 
+            scores = [r['score'] for r in results] if results else []
+
             retrieval_metadata = {
                 "query": query,
                 "total_found": len(results),
                 "excluded_chunks": len(exclude_chunk_ids or []),
                 "retrieval_time_ms": int((time.time() - start_time) * 1000),
                 "search_type": "enhanced_hybrid",
-                "average_score": sum(r['score'] for r in results) / len(results) if results else 0,
-                "score_distribution": {
-                    "min": min((r['score'] for r in results), default=0),
-                    "max": max((r['score'] for r in results), default=0),
-                    "std": self._calculate_std([r['score'] for r in results]) if results else 0
-                }
+                "score_statistics": {
+                    "average": sum(scores) / len(scores) if scores else 0,
+                    "min": min(scores) if scores else 0,
+                    "max": max(scores) if scores else 0,
+                    "std": self._calculate_std(scores) if len(scores) > 1 else 0
+                },
+                "elasticsearch_index": ELASTICSEARCH_INDEX_NAME
             }
 
             return results, retrieval_metadata
 
         except Exception as e:
-            logger.error(f"Error in enhanced hybrid retrieval: {e}")
-            return [], {"error": str(e), "retrieval_time_ms": 0}
+            logger.error(f"Error in hybrid retrieval: {e}")
+            return [], {
+                "error": str(e),
+                "retrieval_time_ms": int((time.time() - start_time) * 1000),
+                "search_type": "failed"
+            }
 
     def _calculate_std(self, values: List[float]) -> float:
         """Calculate standard deviation"""
@@ -603,7 +755,7 @@ class EnhancedChatService:
             chunk_ids: List[str],
             scores: List[float]
     ):
-        """Enhanced chunk memory management"""
+        """Enhanced chunk memory with weighted scoring"""
 
         for chunk_id, score in zip(chunk_ids, scores):
             memory, created = await SessionChunkMemory.get_or_create(
@@ -611,15 +763,16 @@ class EnhancedChatService:
                 chunk_id=chunk_id,
                 defaults={
                     "relevance_score": score,
-                    "usage_count": 1
+                    "usage_count": 1,
+                    "first_used_at": datetime.now(),
+                    "last_used_at": datetime.now()
                 }
             )
 
             if not created:
-                # Update with weighted average of scores
-                old_weight = memory.usage_count / (memory.usage_count + 1)
-                new_weight = 1 / (memory.usage_count + 1)
-                memory.relevance_score = (memory.relevance_score * old_weight + score * new_weight)
+                # Exponential moving average for relevance score
+                alpha = 0.3  # Learning rate
+                memory.relevance_score = (1 - alpha) * memory.relevance_score + alpha * score
                 memory.usage_count += 1
                 memory.last_used_at = datetime.now()
                 await memory.save()
@@ -630,31 +783,42 @@ class EnhancedChatService:
             temperature: float = 0.7,
             max_tokens: int = 1000
     ) -> Tuple[str, Dict[str, int]]:
-        """Generate response using OpenAI"""
+        """Generate response with timeout and retry logic"""
 
-        try:
-            response = await self.openai_client.chat.completions.create(
-                model=self.chat_model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=False
-            )
+        for attempt in range(3):  # Retry up to 3 times
+            try:
+                response = await asyncio.wait_for(
+                    self.openai_client.chat.completions.create(
+                        model=self.chat_model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        stream=False
+                    ),
+                    timeout=self.request_timeout
+                )
 
-            token_usage = {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-                "total_tokens": response.usage.total_tokens
-            }
+                token_usage = {
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "total_tokens": response.usage.total_tokens
+                }
 
-            return response.choices[0].message.content, token_usage
+                return response.choices[0].message.content, token_usage
 
-        except Exception as e:
-            logger.error(f"Error generating response: {e}")
-            raise
+            except asyncio.TimeoutError:
+                logger.warning(f"OpenAI request timeout on attempt {attempt + 1}")
+                if attempt == 2:  # Last attempt
+                    raise
+                await asyncio.sleep(1 * (attempt + 1))  # Exponential backoff
+            except Exception as e:
+                logger.error(f"Error generating response on attempt {attempt + 1}: {e}")
+                if attempt == 2:  # Last attempt
+                    raise
+                await asyncio.sleep(0.5 * (attempt + 1))
 
     async def analyze_conversation_quality(self, session_id: UUID) -> Dict[str, Any]:
-        """Analyze conversation quality metrics"""
+        """Comprehensive conversation quality analysis"""
 
         session = await ChatSession.get_or_none(id=session_id)
         if not session:
@@ -665,84 +829,311 @@ class EnhancedChatService:
         if len(messages) < 2:
             return {"error": "Insufficient conversation data"}
 
-        # Calculate metrics
-        total_messages = len(messages)
+        # Separate user and assistant messages
         user_messages = [m for m in messages if m.role == 'user']
         assistant_messages = [m for m in messages if m.role == 'assistant']
 
-        # Token efficiency
+        # Token efficiency analysis
         total_tokens = sum(m.token_count or 0 for m in assistant_messages)
         avg_tokens_per_response = total_tokens / len(assistant_messages) if assistant_messages else 0
 
         # Chunk usage analysis
         all_used_chunks = []
+        chunk_reuse_data = {}
+
         for msg in assistant_messages:
-            all_used_chunks.extend(msg.used_chunk_ids)
+            for chunk_id in msg.used_chunk_ids:
+                all_used_chunks.append(chunk_id)
+                chunk_reuse_data[chunk_id] = chunk_reuse_data.get(chunk_id, 0) + 1
 
         unique_chunks = len(set(all_used_chunks))
         total_chunk_usage = len(all_used_chunks)
         chunk_reuse_rate = (total_chunk_usage - unique_chunks) / max(total_chunk_usage, 1)
 
-        # Response time analysis
+        # Performance analysis
         response_times = []
+        processing_efficiency = []
+
         for msg in assistant_messages:
             if msg.retrieval_metadata and 'processing_steps' in msg.retrieval_metadata:
-                total_time = sum(step.get('duration_ms', 0) for step in msg.retrieval_metadata['processing_steps'])
+                steps = msg.retrieval_metadata['processing_steps']
+                total_time = sum(step.get('duration_ms', 0) for step in steps)
                 response_times.append(total_time)
 
+                # Calculate processing efficiency
+                retrieval_time = sum(step.get('duration_ms', 0) for step in steps
+                                     if step.get('step') in ['hybrid_retrieval', 'chunk_selection'])
+                generation_time = sum(step.get('duration_ms', 0) for step in steps
+                                      if step.get('step') == 'response_generation')
+
+                if total_time > 0:
+                    efficiency = (retrieval_time + generation_time) / total_time
+                    processing_efficiency.append(efficiency)
+
         avg_response_time = sum(response_times) / len(response_times) if response_times else 0
+        avg_efficiency = sum(processing_efficiency) / len(processing_efficiency) if processing_efficiency else 0
+
+        # Quality scoring
+        quality_scores = {
+            "token_efficiency": self._score_token_efficiency(avg_tokens_per_response),
+            "chunk_utilization": self._score_chunk_utilization(chunk_reuse_rate),
+            "response_speed": self._score_response_speed(avg_response_time),
+            "processing_efficiency": self._score_processing_efficiency(avg_efficiency)
+        }
+
+        overall_quality_score = sum(quality_scores.values()) / len(quality_scores)
 
         return {
             "session_id": str(session_id),
-            "conversation_length": total_messages,
+            "conversation_length": len(messages),
             "user_messages": len(user_messages),
             "assistant_messages": len(assistant_messages),
             "token_efficiency": {
                 "total_tokens": total_tokens,
                 "avg_tokens_per_response": round(avg_tokens_per_response, 2),
-                "token_efficiency_score": min(1000 / max(avg_tokens_per_response, 1), 1.0)
+                "token_efficiency_score": quality_scores["token_efficiency"]
             },
             "chunk_usage": {
                 "unique_chunks_used": unique_chunks,
                 "total_chunk_references": total_chunk_usage,
                 "chunk_reuse_rate": round(chunk_reuse_rate, 3),
                 "avg_chunks_per_response": round(total_chunk_usage / len(assistant_messages),
-                                                 2) if assistant_messages else 0
+                                                 2) if assistant_messages else 0,
+                "most_reused_chunks": sorted(chunk_reuse_data.items(), key=lambda x: x[1], reverse=True)[:5]
             },
             "performance": {
                 "avg_response_time_ms": round(avg_response_time, 2),
-                "response_time_score": max(0, 1 - (avg_response_time / 5000))  # 5s baseline
+                "response_time_score": quality_scores["response_speed"],
+                "processing_efficiency": round(avg_efficiency, 3),
+                "efficiency_score": quality_scores["processing_efficiency"]
             },
-            "overall_quality_score": self._calculate_quality_score(
-                avg_tokens_per_response, chunk_reuse_rate, avg_response_time
-            )
+            "quality_breakdown": quality_scores,
+            "overall_quality_score": round(overall_quality_score, 3),
+            "analysis_timestamp": datetime.now().isoformat()
         }
 
-    def _calculate_quality_score(self, avg_tokens: float, reuse_rate: float, response_time: float) -> float:
-        """Calculate overall conversation quality score (0-1)"""
-
-        # Token efficiency score (prefer 200-800 tokens)
+    def _score_token_efficiency(self, avg_tokens: float) -> float:
+        """Score token efficiency (0-1, higher is better)"""
         if 200 <= avg_tokens <= 800:
-            token_score = 1.0
+            return 1.0
         elif avg_tokens < 200:
-            token_score = avg_tokens / 200
+            return max(0.5, avg_tokens / 200)
         else:
-            token_score = max(0, 1 - (avg_tokens - 800) / 1000)
+            return max(0.1, 1 - (avg_tokens - 800) / 1200)
 
-        # Chunk reuse score (moderate reuse is good)
-        if 0.1 <= reuse_rate <= 0.4:
-            reuse_score = 1.0
-        elif reuse_rate < 0.1:
-            reuse_score = reuse_rate / 0.1
+    def _score_chunk_utilization(self, reuse_rate: float) -> float:
+        """Score chunk utilization (0-1, moderate reuse is optimal)"""
+        if 0.15 <= reuse_rate <= 0.35:
+            return 1.0
+        elif reuse_rate < 0.15:
+            return max(0.3, reuse_rate / 0.15)
         else:
-            reuse_score = max(0, 1 - (reuse_rate - 0.4) / 0.6)
+            return max(0.2, 1 - (reuse_rate - 0.35) / 0.65)
 
-        # Response time score (prefer under 2 seconds)
-        time_score = max(0, 1 - response_time / 3000)
+    def _score_response_speed(self, avg_time_ms: float) -> float:
+        """Score response speed (0-1, faster is better)"""
+        if avg_time_ms <= 1000:
+            return 1.0
+        elif avg_time_ms <= 3000:
+            return 1 - (avg_time_ms - 1000) / 2000 * 0.5
+        else:
+            return max(0.1, 0.5 - (avg_time_ms - 3000) / 5000 * 0.4)
 
-        # Weighted average
-        return round((token_score * 0.4 + reuse_score * 0.3 + time_score * 0.3), 3)
+    def _score_processing_efficiency(self, efficiency: float) -> float:
+        """Score processing efficiency (0-1, higher is better)"""
+        return min(1.0, max(0.1, efficiency))
+
+    async def get_user_chat_statistics(self, user_id: str) -> Dict[str, Any]:
+        """Get comprehensive user chat statistics"""
+
+        # Get all user sessions
+        sessions = await ChatSession.filter(user_id=user_id)
+        if not sessions:
+            return {"error": "No sessions found for user"}
+
+        # Aggregate statistics
+        total_sessions = len(sessions)
+        active_sessions = len([s for s in sessions if s.is_active])
+
+        # Get all messages for the user
+        all_messages = []
+        for session in sessions:
+            session_messages = await ChatMessage.filter(session=session)
+            all_messages.extend(session_messages)
+
+        if not all_messages:
+            return {"error": "No messages found"}
+
+        # Analyze message patterns
+        user_messages = [m for m in all_messages if m.role == 'user']
+        assistant_messages = [m for m in all_messages if m.role == 'assistant']
+
+        # Token usage analysis
+        total_tokens = sum(m.token_count or 0 for m in assistant_messages)
+        avg_tokens_per_message = total_tokens / len(assistant_messages) if assistant_messages else 0
+
+        # Usage patterns
+        message_lengths = [len(m.content) for m in user_messages]
+        avg_message_length = sum(message_lengths) / len(message_lengths) if message_lengths else 0
+
+        # Time-based analysis
+        if all_messages:
+            first_message = min(all_messages, key=lambda x: x.created_at)
+            last_message = max(all_messages, key=lambda x: x.created_at)
+            usage_span_days = (last_message.created_at - first_message.created_at).days + 1
+        else:
+            usage_span_days = 0
+
+        return {
+            "user_id": user_id,
+            "session_statistics": {
+                "total_sessions": total_sessions,
+                "active_sessions": active_sessions,
+                "avg_messages_per_session": round(len(all_messages) / total_sessions, 2) if total_sessions else 0
+            },
+            "message_statistics": {
+                "total_messages": len(all_messages),
+                "user_messages": len(user_messages),
+                "assistant_messages": len(assistant_messages),
+                "avg_user_message_length": round(avg_message_length, 2),
+                "total_tokens_used": total_tokens,
+                "avg_tokens_per_response": round(avg_tokens_per_message, 2)
+            },
+            "usage_patterns": {
+                "usage_span_days": usage_span_days,
+                "messages_per_day": round(len(all_messages) / max(usage_span_days, 1), 2),
+                "most_active_session": str(max(sessions, key=lambda s: len(
+                    [m for m in all_messages if m.session_id == s.id])).id) if sessions else None
+            },
+            "analysis_timestamp": datetime.now().isoformat()
+        }
+
+    async def cleanup_inactive_sessions(self, user_id: str, days_inactive: int = 30) -> Dict[str, Any]:
+        """Clean up inactive sessions and their data"""
+
+        cutoff_date = datetime.now() - timedelta(days=days_inactive)
+
+        # Find inactive sessions
+        inactive_sessions = await ChatSession.filter(
+            user_id=user_id,
+            updated_at__lt=cutoff_date,
+            is_active=True
+        )
+
+        if not inactive_sessions:
+            return {
+                "cleaned_sessions": 0,
+                "cleaned_messages": 0,
+                "cleaned_memory_records": 0
+            }
+
+        session_ids = [s.id for s in inactive_sessions]
+
+        # Count what will be deleted
+        message_count = await ChatMessage.filter(session_id__in=session_ids).count()
+        memory_count = await SessionChunkMemory.filter(session_id__in=session_ids).count()
+
+        # Perform cleanup
+        await ChatMessage.filter(session_id__in=session_ids).delete()
+        await SessionChunkMemory.filter(session_id__in=session_ids).delete()
+
+        # Mark sessions as inactive instead of deleting
+        for session in inactive_sessions:
+            session.is_active = False
+            await session.save()
+
+        logger.info(f"Cleaned up {len(inactive_sessions)} inactive sessions for user {user_id}")
+
+        return {
+            "cleaned_sessions": len(inactive_sessions),
+            "cleaned_messages": message_count,
+            "cleaned_memory_records": memory_count,
+            "cleanup_date": datetime.now().isoformat()
+        }
+
+    async def export_conversation_data(self, session_id: UUID, user_id: str, include_metadata: bool = False) -> Dict[
+        str, Any]:
+        """Export conversation data for backup or analysis"""
+
+        session = await ChatSession.get_or_none(id=session_id, user_id=user_id)
+        if not session:
+            raise ValueError("Session not found")
+
+        messages = await ChatMessage.filter(session=session).order_by('created_at')
+
+        exported_data = {
+            "session_info": {
+                "id": str(session.id),
+                "user_id": session.user_id,
+                "session_name": session.session_name,
+                "created_at": session.created_at.isoformat(),
+                "updated_at": session.updated_at.isoformat(),
+                "config": session.config
+            },
+            "messages": [],
+            "export_metadata": {
+                "exported_at": datetime.now().isoformat(),
+                "total_messages": len(messages),
+                "include_metadata": include_metadata
+            }
+        }
+
+        for msg in messages:
+            message_data = {
+                "id": str(msg.id),
+                "role": msg.role,
+                "content": msg.content,
+                "created_at": msg.created_at.isoformat(),
+                "token_count": msg.token_count
+            }
+
+            if include_metadata and msg.role == "assistant":
+                message_data["used_chunks"] = msg.used_chunk_ids
+                message_data["retrieval_metadata"] = msg.retrieval_metadata
+
+            exported_data["messages"].append(message_data)
+
+        return exported_data
+
+
+# Utility classes for enhanced functionality
+class CacheManager:
+    """Simple in-memory cache manager with TTL support"""
+
+    def __init__(self):
+        self._cache = {}
+        self._expiry = {}
+
+    async def get(self, key: str):
+        """Get value from cache if not expired"""
+        if key in self._cache:
+            if key not in self._expiry or self._expiry[key] > time.time():
+                return self._cache[key]
+            else:
+                # Expired, remove
+                del self._cache[key]
+                del self._expiry[key]
+        return None
+
+    async def set(self, key: str, value: Any, ttl: int = 3600):
+        """Set value in cache with TTL"""
+        self._cache[key] = value
+        self._expiry[key] = time.time() + ttl
+
+    async def exists(self, key: str) -> bool:
+        """Check if key exists and is not expired"""
+        return await self.get(key) is not None
+
+    async def clear_expired(self):
+        """Clear expired entries"""
+        current_time = time.time()
+        expired_keys = [k for k, expiry in self._expiry.items() if expiry <= current_time]
+        for key in expired_keys:
+            if key in self._cache:
+                del self._cache[key]
+            del self._expiry[key]
 
 
 # Global enhanced service instance
 enhanced_chat_service = EnhancedChatService()
+

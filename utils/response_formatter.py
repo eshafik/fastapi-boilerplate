@@ -1,50 +1,92 @@
-from typing import Dict, Any, List
+# utils/response_formatter.py
+from typing import Dict, List, Any, Optional
 from datetime import datetime
+import json
 
 
 class ResponseFormatter:
-    """Format chat responses for consistent API output"""
+    """Utility class for formatting API responses consistently"""
 
-    @staticmethod
-    def format_chunk_metadata(chunk: Dict[str, Any]) -> Dict[str, Any]:
-        """Format chunk metadata for client consumption"""
-        metadata = chunk.get('metadata', {})
+    def format_retrieval_results(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Format retrieved chunks for API response"""
 
-        return {
-            "document_title": metadata.get('document_title', 'Unknown'),
-            "document_type": metadata.get('document_type', 'text'),
-            "page_number": metadata.get('page_number'),
-            "section_title": metadata.get('section_title'),
-            "chunk_index": metadata.get('chunk_index', 0),
-            "token_count": metadata.get('token_count', 0)
-        }
-
-    @staticmethod
-    def format_retrieval_results(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Format retrieval results with consistent structure"""
-        formatted = []
-
+        formatted_chunks = []
         for chunk in chunks:
-            formatted.append({
+            metadata = chunk.get('metadata', {})
+
+            formatted_chunk = {
                 "chunk_id": chunk['chunk_id'],
-                "content": chunk['content'][:500] + "..." if len(chunk['content']) > 500 else chunk['content'],
-                "score": round(chunk['score'], 4),
-                "metadata": ResponseFormatter.format_chunk_metadata(chunk),
-                "source_type": "fresh"
-            })
+                "content": self._truncate_content(chunk['content'], max_length=300),
+                "score": round(chunk.get('adjusted_score', chunk.get('score', 0)), 4),
+                "source": {
+                    "document_title": metadata.get('document_title', 'Unknown'),
+                    "page_number": metadata.get('page_number'),
+                    "section_title": metadata.get('section_title'),
+                    "document_type": metadata.get('document_type', 'text')
+                }
+            }
 
-        return formatted
+            # Add score breakdown if available (for debugging)
+            if 'score_breakdown' in chunk:
+                formatted_chunk['score_details'] = chunk['score_breakdown']
 
-    @staticmethod
-    def format_error_response(error: Exception, context: str = "") -> Dict[str, Any]:
-        """Format error responses consistently"""
-        return {
-            "error": True,
-            "message": str(error),
-            "context": context,
-            "timestamp": datetime.now().isoformat(),
-            "type": type(error).__name__
+            formatted_chunks.append(formatted_chunk)
+
+        return formatted_chunks
+
+    def format_error_response(self, error: str, error_code: str = None, details: Dict[str, Any] = None) -> Dict[
+        str, Any]:
+        """Format error response consistently"""
+
+        response = {
+            "error": error,
+            "timestamp": datetime.now().isoformat()
         }
+
+        if error_code:
+            response["error_code"] = error_code
+
+        if details:
+            response["details"] = details
+
+        return response
+
+    def format_streaming_message(self, message_type: str, data: Dict[str, Any]) -> str:
+        """Format Server-Sent Events message"""
+
+        message = {
+            "type": message_type,
+            "data": data,
+            "timestamp": datetime.now().isoformat()
+        }
+
+        return f"data: {json.dumps(message)}\n\n"
+
+    def _truncate_content(self, content: str, max_length: int = 300) -> str:
+        """Truncate content while preserving readability"""
+
+        if len(content) <= max_length:
+            return content
+
+        # Find a good breaking point near the limit
+        truncated = content[:max_length]
+
+        # Try to break at sentence end
+        last_period = truncated.rfind('.')
+        last_exclamation = truncated.rfind('!')
+        last_question = truncated.rfind('?')
+
+        sentence_end = max(last_period, last_exclamation, last_question)
+
+        if sentence_end > max_length * 0.7:  # If we found a good break point
+            return content[:sentence_end + 1]
+
+        # Otherwise break at word boundary
+        last_space = truncated.rfind(' ')
+        if last_space > max_length * 0.8:
+            return content[:last_space] + "..."
+
+        return truncated + "..."
 
 
 response_formatter = ResponseFormatter()
