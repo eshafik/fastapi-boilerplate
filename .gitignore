@@ -87,4 +87,4 @@ pip-requirements/
 # Ignore any environment-specific files
 .env.*
 .env
-.sqlite*
+*.sqlite*

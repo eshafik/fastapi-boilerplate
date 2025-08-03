@@ -4,7 +4,8 @@ from celery import Celery, signals
 from config.db import init_db
 from config.settings import CELERY_BROKER_URL, CELERY_RESULT_BACKEND, INSTALLED_APPS
 
-celery_app = Celery('fastapi_tortoise_boilerplate', broker=CELERY_BROKER_URL, backend=CELERY_RESULT_BACKEND)
+celery_app = Celery('es_rag', broker=CELERY_BROKER_URL,
+                    backend=CELERY_RESULT_BACKEND)
 
 celery_app.conf.update(
     task_serializer='json',
@@ -16,7 +17,7 @@ celery_app.conf.update(
 
 
 # Auto-discover tasks from all apps
-celery_app.autodiscover_tasks([app for app in INSTALLED_APPS])
+celery_app.autodiscover_tasks(INSTALLED_APPS)
 celery_app.conf.update(
     result_expires=3600,
 )
